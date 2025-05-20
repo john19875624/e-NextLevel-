@@ -1,0 +1,484 @@
+// ==UserScript==
+// @name         e-NextLevel カレンダー登録ボタン (v1.9.2 Refactored)
+// @namespace    http://tampermonkey.net/
+// @version      1.9.2
+// @description  作業日と集合～終了時刻をGoogleカレンダーに登録する（登録済み表示付き）。UIで取得値確認可能、エラーで終了しない、集合時間＞終了時刻なら翌日解釈、UI拡大、持ち物と服装をdl/dt/dd構造から取得。集合場所を除去。読みやすさを向上。
+// @match        https://www.e-nextlevel.jp/work/detail/*
+// @grant        GM_setValue
+// @grant        GM_getValue
+// @run-at       document-idle
+// ==/UserScript==
+
+(function() {
+    'use strict';
+    console.log('[e-NextLevel Calendar v1.9.2 Refactored] Script Started');
+
+    // --- 定数定義 ---
+    const JOB_ID_REGEX = /\/(\d+)$/;
+    const REGISTERED_FLAG_PREFIX = 'calendar_registered_';
+    // const DATETIME_FORMAT = "YYYYMMDDTHHmmss"; // Google Calendar format (simplified representation) - Not directly used, but good for reference
+
+    // --- ヘルパー関数 ---
+
+    /**
+     * URLパスからジョブIDを取得します。
+     * @returns {string|null} ジョブIDまたはnull
+     */
+    function getJobIdFromUrl() {
+        const match = location.pathname.match(JOB_ID_REGEX);
+        return match ? match[1] : null;
+    }
+
+    /**
+     * 指定された日付と時刻をGoogle Calendar APIが要求する形式に近い文字列にフォーマットします。
+     * @param {string} dateStr - 'YYYY-MM-DD' 形式の日付文字列
+     * @param {string} timeStr - 'HH:MM' 形式の時刻文字列
+     * @param {number} [dayAdjustment=0] - 日付に加算する日数（翌日の場合など）
+     * @returns {string} フォーマットされた日付時刻文字列 (例: '20230401T090000')、または空文字列
+     */
+    function formatDateTimeForCalendar(dateStr, timeStr, dayAdjustment = 0) {
+        if (!dateStr || !timeStr) {
+            console.warn('[e-NextLevel Calendar] Cannot format empty date or time.');
+            return '';
+        }
+        try {
+            const [year, month, day] = dateStr.split('-').map(Number);
+            // Dateオブジェクトは月を0から数えるため month - 1
+            const dateObj = new Date(year, month - 1, day);
+            if (isNaN(dateObj)) { // Check if the date is valid
+                 console.error('[e-NextLevel Calendar] Invalid date string provided:', dateStr);
+                 return '';
+            }
+            dateObj.setDate(dateObj.getDate() + dayAdjustment);
+
+            const yyyy = dateObj.getFullYear();
+            const mm = String(dateObj.getMonth() + 1).padStart(2, '0');
+            const dd = String(dateObj.getDate()).padStart(2, '0');
+            const time = timeStr.replace(/:/g, '');
+
+            // Basic validation for time format
+            if (!/^\d{4}$/.test(time)) {
+                 console.error('[e-NextLevel Calendar] Invalid time string provided:', timeStr);
+                 return '';
+            }
+
+            return `${yyyy}${mm}${dd}T${time}00`;
+        } catch (e) {
+            console.error('[e-NextLevel Calendar] Error formatting date/time:', dateStr, timeStr, e);
+            return '';
+        }
+    }
+
+    /**
+     * 開始時刻と終了時刻を比較し、終了時刻が翌日になるか判断します。
+     * @param {string} startTime - 'HH:MM' 形式の開始時刻
+     * @param {string} endTime - 'HH:MM' 形式の終了時刻
+     * @returns {number} 終了日が翌日の場合は 1, それ以外は 0
+     */
+    function calculateEndTimeDayAdjustment(startTime, endTime) {
+        if (!startTime || !endTime) return 0;
+        try {
+            const [startHour, startMinute] = startTime.split(':').map(Number);
+            const [endHour, endMinute] = endTime.split(':').map(Number);
+
+            if (isNaN(startHour) || isNaN(startMinute) || isNaN(endHour) || isNaN(endMinute)) {
+                 console.error('[e-NextLevel Calendar] Invalid time format for comparison:', startTime, endTime);
+                 return 0;
+            }
+
+            const startMinutes = startHour * 60 + startMinute;
+            const endMinutes = endHour * 60 + endMinute;
+            return startMinutes > endMinutes ? 1 : 0;
+        } catch (e) {
+            console.error('[e-NextLevel Calendar] Error comparing times:', startTime, endTime, e);
+            return 0; // エラー時は調整しない
+        }
+    }
+
+    /**
+     * ページから仕事の詳細情報を抽出します。
+     * @returns {object|null} 抽出された仕事情報オブジェクト、または抽出失敗時にnull
+     */
+    function extractJobDetails() {
+        try {
+            const pageText = document.body.innerText; // Keep for date/time extraction if selectors fail
+
+            // --- 基本情報の抽出 (日付、時刻、タイトル) ---
+            // 日付: YYYY年 MM月 DD日 形式
+            const dateMatch = pageText.match(/(\d{4})年\s*(\d{1,2})月\s*(\d{1,2})日/);
+            const date = dateMatch ? `${dateMatch[1]}-${String(dateMatch[2]).padStart(2, '0')}-${String(dateMatch[3]).padStart(2, '0')}` : '';
+
+            // 作業時間範囲: HH:MM～HH:MM 形式
+            const timeRangeMatch = pageText.match(/(\d{1,2}):(\d{2})～(\d{1,2}):(\d{2})/);
+            const endTime = timeRangeMatch ? `${String(timeRangeMatch[3]).padStart(2, '0')}:${timeRangeMatch[4]}` : '';
+
+            // 開始時刻: '作業日当日 HH:MM' 形式から最も早いものを探す。見つからなければ作業時間範囲の開始時刻。
+            const timeMatches = Array.from(pageText.matchAll(/作業日当日\s*(\d{1,2}):(\d{2})/g));
+            let startTime = '';
+            if (timeMatches.length > 0) {
+                 startTime = timeMatches.reduce((earliestTime, currentMatch) => {
+                     const currentTimeStr = `${String(currentMatch[1]).padStart(2, '0')}:${currentMatch[2]}`;
+                     return !earliestTime || currentTimeStr < earliestTime ? currentTimeStr : earliestTime;
+                 }, null);
+            } else if (timeRangeMatch) {
+                 startTime = `${String(timeRangeMatch[1]).padStart(2, '0')}:${timeRangeMatch[2]}`;
+            }
+
+            // タイトル
+            const titleElement = document.querySelector('h2.jobDetailInfo__title');
+            const title = titleElement?.innerText?.trim() || '';
+
+            // --- 詳細情報の抽出 ---
+
+            // 現場住所 (Selector needs verification/adjustment if site structure changes)
+            const placeElement = document.querySelector('li.jobInfoList__item.is_place');
+            const jobSiteAddress = placeElement?.innerText.trim() || '';
+
+            // 服装と持ち物 (dl/dt/dd構造に対応)
+            let dressCode = '';
+            let requiredItems = '';
+            const detailTitles = document.querySelectorAll('dt.jobDetailOther__title');
+
+            detailTitles.forEach(dtElement => {
+                const titleText = dtElement.innerText.trim();
+                const ddElement = dtElement.nextElementSibling; // dt の直後の要素を取得
+
+                // dd要素が存在し、期待されるクラスを持っているか確認
+                if (ddElement && ddElement.tagName === 'DD' && ddElement.classList.contains('jobDetailOther__cont')) {
+                    const contentText = ddElement.innerText.trim();
+                    if (titleText === '服装') {
+                        dressCode = contentText;
+                        console.log('[e-NextLevel Calendar] Found Dress Code:', dressCode);
+                    } else if (titleText === '持ち物') {
+                        requiredItems = contentText;
+                        console.log('[e-NextLevel Calendar] Found Required Items:', requiredItems);
+                    }
+                } else {
+                     console.log(`[e-NextLevel Calendar] Sibling DD for DT '${titleText}' not found or missing expected class.`);
+                }
+            });
+
+            // 必須情報が取得できているか確認
+            if (!date || !startTime || !endTime || !title) {
+                 console.warn('[e-NextLevel Calendar] Essential information (date, time, title) could not be extracted. Date:', date, 'Start:', startTime, 'End:', endTime, 'Title:', title);
+                 // Return null or partial object if essential info is missing? Currently returns partial.
+            }
+
+            return {
+                date,
+                startTime,
+                endTime,
+                title,
+                jobSiteAddress, // NOTE: Selector needs verification if site structure changes
+                // meetingPlace removed as requested
+                requiredItems,
+                dressCode
+            };
+        } catch (e) {
+            console.error('[e-NextLevel Calendar] Error extracting job details:', e);
+            return null;
+        }
+    }
+
+    /**
+     * Google Calendar登録用のURLを生成します。
+     * @param {object} jobDetails - extractJobDetailsから返された仕事情報
+     * @returns {string} Google CalendarのURL文字列、または空文字列
+     */
+    function generateCalendarUrl(jobDetails) {
+        if (!jobDetails) {
+             console.error('[e-NextLevel Calendar] Cannot generate URL without job details.');
+             return '';
+        }
+
+        const {
+            date, startTime, endTime, title, jobSiteAddress, requiredItems, dressCode
+            // meetingPlace removed
+        } = jobDetails;
+
+        // Check for essential details needed for the URL
+        if (!date || !startTime || !endTime || !title) {
+            console.warn('[e-NextLevel Calendar] Missing essential details (date, time, title) for URL generation.');
+            return '';
+        }
+
+        // 終了時刻が翌日になるか計算
+        const endTimeDayAdjustment = calculateEndTimeDayAdjustment(startTime, endTime);
+
+        // URLオブジェクトの作成
+        const calendarUrl = new URL('https://calendar.google.com/calendar/render');
+        calendarUrl.searchParams.set('action', 'TEMPLATE');
+
+        // タイトル
+        calendarUrl.searchParams.set('text', title); // Title is mandatory for a useful event
+
+        // 詳細 (Description) - Including required items and dress code as requested
+        const itemsText = requiredItems ? `持ち物:\n${requiredItems}` : '';
+        const attireText = dressCode ? `服装:\n${dressCode}` : '';
+        // Join items and attire only if at least one exists, with a separator
+        const itemsAndAttire = [itemsText, attireText].filter(Boolean).join('\n\n');
+
+        const detailsLines = [
+            location.href ? `詳細URL: ${location.href}` : '',
+            jobSiteAddress ? `現場住所: ${jobSiteAddress}` : '',
+            // meetingPlace removed
+            itemsAndAttire ? `\n${itemsAndAttire}` : '' // Add newline before if it exists
+        ];
+        // Join non-empty lines with double newlines for readability in the description
+        const detailsText = detailsLines.filter(line => line.trim() !== '').join('\n\n');
+        if (detailsText) calendarUrl.searchParams.set('details', detailsText);
+
+        // 場所 (Location) - Use job site address if available
+        if (jobSiteAddress) calendarUrl.searchParams.set('location', jobSiteAddress);
+
+        // 日時 (Dates) - Mandatory for calendar event
+        const startDateTime = formatDateTimeForCalendar(date, startTime, 0);
+        const endDateTime = formatDateTimeForCalendar(date, endTime, endTimeDayAdjustment);
+
+        if (startDateTime && endDateTime) {
+            calendarUrl.searchParams.set('dates', `${startDateTime}/${endDateTime}`);
+        } else {
+            console.error('[e-NextLevel Calendar] Failed to format valid start/end dateTimes for calendar URL.');
+            return ''; // Date/Time formatting failed, cannot create a valid URL
+        }
+
+        console.log('[e-NextLevel Calendar] Generated Google Calendar URL:', calendarUrl.toString());
+        return calendarUrl.toString();
+    }
+
+   /**
+     * UI要素のスタイルを設定するヘルパー関数。
+     * @param {HTMLElement} element - スタイルを設定する要素
+     * @param {object} styles - 適用するCSSスタイルのオブジェクト
+     */
+    function applyStyles(element, styles) {
+        Object.assign(element.style, styles);
+    }
+
+    /**
+     * 情報を表示し、カレンダー登録ボタンを持つUIを作成してページに追加します。
+     * @param {object} jobDetails - 抽出された仕事情報
+     * @param {string} calendarUrl - 生成されたGoogle Calendar URL
+     * @param {boolean} isInitiallyRegistered - 初期登録状態
+     * @param {string|null} registrationFlagKey - 登録状態を保存するGM_setValueのキー
+     */
+    function createAndAppendUI(jobDetails, calendarUrl, isInitiallyRegistered, registrationFlagKey) {
+         if (!jobDetails) {
+             console.warn('[e-NextLevel Calendar] Cannot create UI without job details.');
+             return;
+         }
+         console.log('[e-NextLevel Calendar] Creating UI elements...');
+
+         const {
+             date, startTime, endTime, title, jobSiteAddress, requiredItems, dressCode
+             // meetingPlace removed
+         } = jobDetails;
+         const endTimeDayAdjustment = calculateEndTimeDayAdjustment(startTime, endTime);
+
+         // --- UIコンテナ ---
+         const uiContainer = document.createElement('div');
+         uiContainer.id = 'enextlevel-calendar-ui'; // Add an ID for easier debugging/styling
+         applyStyles(uiContainer, {
+             position: 'fixed',
+             top: '20px',
+             right: '20px',
+             zIndex: 10000,
+             display: 'flex',
+             flexDirection: 'column',
+             gap: '12px', // Consistent spacing
+             fontSize: '16px', // Base font size slightly smaller for better fit
+             backgroundColor: 'rgba(255, 255, 255, 0.97)', // Slightly more opaque
+             padding: '20px',
+             border: '1px solid #cccccc', // Less prominent border
+             maxWidth: '450px',
+             maxHeight: 'calc(100vh - 40px)', // Adjust max height based on viewport
+             overflowY: 'auto',
+             borderRadius: '8px', // Slightly smaller radius
+             boxShadow: '0 4px 10px rgba(0, 0, 0, 0.15)', // Softer shadow
+             fontFamily: 'sans-serif' // Ensure consistent font
+         });
+
+         // --- 情報表示エリア ---
+         const infoDisplayElement = document.createElement('div');
+         applyStyles(infoDisplayElement, {
+             fontSize: '14px', // Smaller font for details
+             lineHeight: '1.6',
+             wordBreak: 'break-word'
+         });
+         // Use spans for potentially missing data for cleaner look
+         const missingSpan = '<span style="color:#cc0000; font-style:italic;">未取得</span>';
+         const nextDaySpan = '<span style="color: #cc0000; font-weight: bold;"> (翌日)</span>';
+         infoDisplayElement.innerHTML = `
+             <strong style="font-size: 16px; color: #3366cc; display: block; margin-bottom: 10px; border-bottom: 1px solid #eee; padding-bottom: 5px;">抽出情報:</strong>
+             日付: <strong>${date || missingSpan}</strong><br>
+             開始: <strong>${startTime || missingSpan}</strong><br>
+             終了: <strong>${endTime || missingSpan}</strong>${endTimeDayAdjustment ? nextDaySpan : ''}<br>
+             タイトル: <strong>${title || missingSpan}</strong><br>
+             <div style="margin-top: 8px; padding-top: 8px; border-top: 1px dotted #ccc;">
+             現場住所: ${jobSiteAddress || '未取得'}<br>
+             持ち物: ${requiredItems || '未取得'}<br>
+             服装: ${dressCode || '未取得'}
+             </div>
+         `;
+         uiContainer.appendChild(infoDisplayElement);
+
+         // --- カレンダー登録ボタン ---
+         const calendarButton = document.createElement('button');
+         calendarButton.textContent = '📅 Google Calendarに登録';
+         applyStyles(calendarButton, {
+             padding: '12px 20px', // Slightly smaller padding
+             background: '#34A853',
+             color: 'white',
+             border: 'none',
+             borderRadius: '5px',
+             cursor: 'pointer',
+             fontSize: '15px', // Slightly smaller font size
+             fontWeight: 'bold',
+             textAlign: 'center',
+             boxShadow: '0 2px 4px rgba(0, 0, 0, 0.2)',
+             transition: 'background-color 0.2s ease, box-shadow 0.2s ease, transform 0.1s ease'
+         });
+
+         // URL生成失敗、または必須情報不足の場合はボタンを無効化
+         // Calendar URL generation already checks for essential info now
+         const isButtonDisabled = !calendarUrl;
+         calendarButton.disabled = isButtonDisabled;
+         if (isButtonDisabled) {
+             calendarButton.style.backgroundColor = '#bdbdbd'; // More distinct disabled color
+             calendarButton.style.cursor = 'not-allowed';
+             calendarButton.style.boxShadow = 'none';
+             calendarButton.textContent = '📅 登録不可 (情報不足/エラー)';
+         } else {
+              // Add hover/active effects only if enabled
+              calendarButton.onmouseover = () => { calendarButton.style.backgroundColor = '#2c8a43'; };
+              calendarButton.onmouseout = () => { calendarButton.style.backgroundColor = '#34A853'; };
+              calendarButton.onmousedown = () => { calendarButton.style.transform = 'translateY(1px)'; calendarButton.style.boxShadow = '0 1px 2px rgba(0, 0, 0, 0.3)'; };
+              calendarButton.onmouseup = () => { calendarButton.style.transform = 'translateY(0)'; calendarButton.style.boxShadow = '0 2px 4px rgba(0, 0, 0, 0.2)';};
+         }
+
+
+         // Defined registrationStatusElement here so it's available in the onclick scope
+         const registrationStatusElement = document.createElement('div');
+
+         calendarButton.onclick = () => {
+             if (calendarButton.disabled) return;
+             console.log('[e-NextLevel Calendar] Calendar button clicked! Opening URL:', calendarUrl);
+             window.open(calendarUrl, '_blank');
+             // 登録フラグキーがあれば、フラグを立ててUIを更新
+             if (registrationFlagKey) {
+                 GM_setValue(registrationFlagKey, true);
+                 console.log(`[e-NextLevel Calendar] Set registration flag '${registrationFlagKey}' to true.`);
+                 // registrationStatusElement is defined below, update it
+                 updateRegistrationStatus(registrationStatusElement, true);
+             }
+         };
+         uiContainer.appendChild(calendarButton);
+
+         // --- 登録ステータス表示 ---
+         // registrationStatusElement was defined above
+         applyStyles(registrationStatusElement, {
+             textAlign: 'center',
+             marginTop: '8px', // Reduced margin
+             fontSize: '14px', // Smaller font size
+             fontWeight: 'normal'
+         });
+         // 初期状態を設定
+         updateRegistrationStatus(registrationStatusElement, isInitiallyRegistered);
+         console.log('[e-NextLevel Calendar] Status element created.');
+         uiContainer.appendChild(registrationStatusElement);
+
+
+         // --- UIをページに追加 ---
+         try {
+             // Remove existing UI if script runs again (e.g., during development/debugging)
+             const existingUI = document.getElementById('enextlevel-calendar-ui');
+             if(existingUI) {
+                 existingUI.remove();
+             }
+             document.body.appendChild(uiContainer);
+             console.log('[e-NextLevel Calendar] UI container appended to document body.');
+         } catch (e) {
+             console.error('[e-NextLevel Calendar] Error appending UI container:', e);
+         }
+     }
+
+    /**
+     * 登録ステータス表示を更新します。
+     * @param {HTMLElement} statusElement - ステータス表示用のHTML要素
+     * @param {boolean} isRegistered - 登録済みかどうか
+     */
+    function updateRegistrationStatus(statusElement, isRegistered) {
+        if (!statusElement) return; // 要素が存在しない場合は何もしない
+        statusElement.textContent = isRegistered ? '✅ 登録済み' : '🕒 未登録';
+        statusElement.style.color = isRegistered ? '#2e7d32' : '#757575'; // Use specific colors
+        statusElement.style.fontWeight = isRegistered ? 'bold' : 'normal';
+        console.log('[e-NextLevel Calendar] Registration status updated:', statusElement.textContent);
+    }
+
+   /**
+     * 情報取得失敗時にシンプルなエラーUIを表示します。
+     */
+   function displayExtractionErrorUI() {
+        const errorContainer = document.createElement('div');
+        errorContainer.id = 'enextlevel-calendar-error-ui'; // Add ID
+        applyStyles(errorContainer, {
+            position: 'fixed', top: '20px', right: '20px', zIndex: 10000,
+            padding: '10px 15px', background: 'rgba(255, 224, 224, 0.95)', border: '1px solid #cc0000',
+            borderRadius: '5px', color: '#cc0000', fontSize: '14px', fontFamily: 'sans-serif'
+        });
+        errorContainer.textContent = '📅 カレンダー登録: 情報取得エラー';
+        try {
+             // Remove existing error UI if present
+             const existingErrorUI = document.getElementById('enextlevel-calendar-error-ui');
+             if(existingErrorUI) {
+                 existingErrorUI.remove();
+             }
+            document.body.appendChild(errorContainer);
+        } catch (e) {
+             console.error('[e-NextLevel Calendar] Error appending error container:', e);
+        }
+    }
+
+    // --- メイン処理 ---
+    function main() {
+        console.log('[e-NextLevel Calendar] Starting main execution...');
+        // 1. ジョブIDと登録状態の取得
+        const jobId = getJobIdFromUrl();
+        const registrationFlagKey = jobId ? `${REGISTERED_FLAG_PREFIX}${jobId}` : null;
+        let isInitiallyRegistered = false; // Default to false
+        if (registrationFlagKey) {
+             try {
+                 isInitiallyRegistered = GM_getValue(registrationFlagKey, false);
+             } catch (e) {
+                  console.error("[e-NextLevel Calendar] Error getting GM_getValue:", e);
+                  // Proceed with false, but log the error
+             }
+        }
+        console.log(`[e-NextLevel Calendar] Job ID: ${jobId}, Flag Key: ${registrationFlagKey}, Initial Status: ${isInitiallyRegistered}`);
+
+        // 2. 仕事詳細情報の抽出
+        const jobDetails = extractJobDetails();
+
+        // 3. 抽出成功時のみURL生成とUI作成を行う
+        if (jobDetails) {
+            // 3.1 Google Calendar URLの生成
+            const calendarUrl = generateCalendarUrl(jobDetails);
+
+            // 3.2 UIの作成と表示 (URL生成失敗時は calendarUrl が空文字列になり、ボタンが無効化される)
+            createAndAppendUI(jobDetails, calendarUrl, isInitiallyRegistered, registrationFlagKey);
+
+        } else {
+            console.error("[e-NextLevel Calendar] Could not extract job details. Displaying error UI.");
+            // 情報取得失敗を示すUIを表示
+            displayExtractionErrorUI();
+        }
+
+        console.log('[e-NextLevel Calendar v1.9.2 Refactored] Script Finished');
+    }
+
+    // --- スクリプト実行 ---
+    // 遅延実行やDOM監視が必要な場合に追加可能だが、@run-at document-idleで通常は十分
+    // window.addEventListener('load', main); // Or use MutationObserver if content loads dynamically after initial idle
+    main(); // Execute directly as run-at is document-idle
+
+})();
