@@ -1,83 +1,202 @@
 // ==UserScript==
-// @name         Auto Close Dynamic Modal Banners (with Logging)
+// @name         e-NextLevel カレンダー登録ボタン (v1.9.3 Refactored)
 // @namespace    http://tampermonkey.net/
-// @version      1.4
-// @description  Automatically close all modal banners dynamically, with logging
-// @author       Grok
-// @match        https://www.e-nextlevel.jp/work/list
-// @grant        none
+// @version      1.9.3
+// @description  作業日と集合～終了時刻をGoogleカレンダーに登録する（折りたたみUI・関数分離強化）
+// @match        https://www.e-nextlevel.jp/work/detail/*
+// @grant        GM_setValue
+// @grant        GM_getValue
+// @run-at       document-idle
 // ==/UserScript==
 
 (function () {
     'use strict';
+    console.log('[e-NextLevel Calendar v1.9.3 Refactored] Script Started');
 
-    // 指定されたモーダルが表示中か判定
-    function isModalVisible(modal) {
-        return modal.style.display === 'block' ||
-               modal.classList.contains('in') ||
-               modal.classList.contains('show');
+    const REGISTERED_FLAG_PREFIX = 'calendar_registered_';
+
+    // --- ヘルパー関数群 ---
+
+    function getJobIdFromUrl() {
+        const match = location.pathname.match(/\/(\d+)$/);
+        return match ? match[1] : null;
     }
 
-    // モーダル内の要素をチェックして閉じる処理を行う
-    function checkAndCloseModal(modal) {
-        if (!isModalVisible(modal)) return;
-
-        console.log('[Modal AutoClose] 表示中のモーダル検出:', modal);
-
-        // 閉じるボタンを探してクリック
-        const closeButton = modal.querySelector('button[data-dismiss="modal"], button.close, [aria-label="Close"]');
-        if (closeButton) {
-            closeButton.click();
-            console.log('[Modal AutoClose] 閉じるボタンをクリックしました');
-        } else {
-            console.log('[Modal AutoClose] 閉じるボタンが見つかりません');
-        }
-
-        // 「今後表示しない」チェックボックスがあればチェック
-        const doNotShowCheckbox = modal.querySelector('input[type="checkbox"][id*="check-hide"], input[type="checkbox"][name*="hide"]');
-        if (doNotShowCheckbox && !doNotShowCheckbox.checked) {
-            doNotShowCheckbox.click();
-            console.log('[Modal AutoClose] 「今後表示しない」チェックボックスをオンにしました');
-        }
+    function extractDateFromText(text) {
+        const match = text.match(/(\d{4})年\s*(\d{1,2})月\s*(\d{1,2})日/);
+        return match ? `${match[1]}-${String(match[2]).padStart(2, '0')}-${String(match[3]).padStart(2, '0')}` : '';
     }
 
-    // すべてのモーダル要素をチェックして必要に応じて閉じる
-    function closeVisibleModals() {
-        const modalElements = document.querySelectorAll('.modal, [class*="modal"]');
-        if (modalElements.length > 0) {
-            console.log(`[Modal AutoClose] モーダル候補 ${modalElements.length} 件を確認`);
+    function extractTimesFromText(text) {
+        const rangeMatch = text.match(/(\d{1,2}):(\d{2})～(\d{1,2}):(\d{2})/);
+        const endTime = rangeMatch ? `${String(rangeMatch[3]).padStart(2, '0')}:${rangeMatch[4]}` : '';
+        const timeMatches = Array.from(text.matchAll(/作業日当日\s*(\d{1,2}):(\d{2})/g));
+        let startTime = '';
+        if (timeMatches.length > 0) {
+            startTime = timeMatches.reduce((earliest, curr) => {
+                const timeStr = `${String(curr[1]).padStart(2, '0')}:${curr[2]}`;
+                return !earliest || timeStr < earliest ? timeStr : earliest;
+            }, null);
+        } else if (rangeMatch) {
+            startTime = `${String(rangeMatch[1]).padStart(2, '0')}:${rangeMatch[2]}`;
         }
-        modalElements.forEach(checkAndCloseModal);
+        return { startTime, endTime };
     }
 
-    // MutationObserverのコールバック関数
-    function onMutations(mutations) {
-        const hasModalAdded = mutations.some(mutation =>
-            Array.from(mutation.addedNodes).some(node =>
-                node.nodeType === 1 &&
-                (node.matches('.modal, [class*="modal"]') || node.querySelector('.modal, [class*="modal"]'))
-            )
-        );
-        if (hasModalAdded) {
-            console.log('[Modal AutoClose] DOMに新しいモーダルが追加されました');
-            closeVisibleModals();
-        }
+    function extractTitle() {
+        const el = document.querySelector('h2.jobDetailInfo__title');
+        return el?.innerText?.trim() || '';
     }
 
-    // 初回ロード時の実行
-    window.addEventListener('load', () => {
-        console.log('[Modal AutoClose] ページ読み込み完了 - 初回チェック開始');
-        closeVisibleModals();
-    });
+    function extractClothingAndItems() {
+        const detailTitles = document.querySelectorAll('dt.jobDetailOther__title');
+        let dressCode = '', requiredItems = '';
+        detailTitles.forEach(dt => {
+            const titleText = dt.innerText.trim();
+            const dd = dt.nextElementSibling;
+            if (dd && dd.tagName === 'DD' && dd.classList.contains('jobDetailOther__cont')) {
+                const text = dd.innerText.trim();
+                if (titleText === '服装') dressCode = text;
+                if (titleText === '持ち物') requiredItems = text;
+            }
+        });
+        return { dressCode, requiredItems };
+    }
 
-    // DOMの変更を監視して動的に追加されるモーダルにも対応
-    const observer = new MutationObserver(onMutations);
-    observer.observe(document.body, { childList: true, subtree: true });
-    console.log('[Modal AutoClose] MutationObserver を初期化しました');
+    function calculateEndTimeDayAdjustment(start, end) {
+        const [sh, sm] = start.split(':').map(Number);
+        const [eh, em] = end.split(':').map(Number);
+        return sh * 60 + sm > eh * 60 + em ? 1 : 0;
+    }
 
-    // 定期的なチェック（0.5秒ごと）
-    setInterval(() => {
-        console.log('[Modal AutoClose] 定期チェック実行中');
-        closeVisibleModals();
-    }, 500);
+    function formatDateTime(dateStr, timeStr, addDay = 0) {
+        if (!dateStr || !timeStr) return '';
+        const [y, m, d] = dateStr.split('-').map(Number);
+        const date = new Date(y, m - 1, d);
+        if (isNaN(date)) return '';
+        date.setDate(date.getDate() + addDay);
+        const yyyy = date.getFullYear();
+        const mm = String(date.getMonth() + 1).padStart(2, '0');
+        const dd = String(date.getDate()).padStart(2, '0');
+        const time = timeStr.replace(/:/g, '');
+        if (!/^\d{4}$/.test(time)) return '';
+        return `${yyyy}${mm}${dd}T${time}00`;
+    }
+
+    function extractJobDetails() {
+        const text = document.body.innerText;
+        const date = extractDateFromText(text);
+        const { startTime, endTime } = extractTimesFromText(text);
+        const title = extractTitle();
+        const address = document.querySelector('li.jobInfoList__item.is_place')?.innerText.trim() || '';
+        const { dressCode, requiredItems } = extractClothingAndItems();
+        return { date, startTime, endTime, title, jobSiteAddress: address, dressCode, requiredItems };
+    }
+
+    function generateCalendarUrl({ date, startTime, endTime, title, jobSiteAddress, requiredItems, dressCode }) {
+        if (!date || !startTime || !endTime || !title) return '';
+        const adj = calculateEndTimeDayAdjustment(startTime, endTime);
+        const url = new URL('https://calendar.google.com/calendar/render');
+        url.searchParams.set('action', 'TEMPLATE');
+        url.searchParams.set('text', title);
+
+        const lines = [
+            `詳細URL: ${location.href}`,
+            jobSiteAddress ? `現場住所: ${jobSiteAddress}` : '',
+            requiredItems ? `\n持ち物:\n${requiredItems}` : '',
+            dressCode ? `\n服装:\n${dressCode}` : ''
+        ].filter(Boolean);
+
+        url.searchParams.set('details', lines.join('\n\n'));
+        if (jobSiteAddress) url.searchParams.set('location', jobSiteAddress);
+
+        const start = formatDateTime(date, startTime);
+        const end = formatDateTime(date, endTime, adj);
+        if (start && end) url.searchParams.set('dates', `${start}/${end}`);
+        return url.toString();
+    }
+
+    function applyStyles(el, styles) {
+        Object.assign(el.style, styles);
+    }
+
+    function updateRegistrationStatus(el, registered) {
+        el.textContent = registered ? '✅ 登録済み' : '🕒 未登録';
+        el.style.color = registered ? '#2e7d32' : '#757575';
+        el.style.fontWeight = registered ? 'bold' : 'normal';
+    }
+
+    function createAndAppendUI(details, calendarUrl, isRegistered, flagKey) {
+        const { date, startTime, endTime, title, jobSiteAddress, requiredItems, dressCode } = details;
+        const adj = calculateEndTimeDayAdjustment(startTime, endTime);
+
+        const ui = document.createElement('div');
+        ui.id = 'calendar-ui';
+        applyStyles(ui, { position: 'fixed', top: '20px', right: '20px', background: '#fff', border: '1px solid #ccc', padding: '12px', zIndex: 10000, fontFamily: 'sans-serif', borderRadius: '8px', boxShadow: '0 4px 10px rgba(0,0,0,0.1)', maxWidth: '400px' });
+
+        const toggleBtn = document.createElement('button');
+        toggleBtn.textContent = '▼';
+        applyStyles(toggleBtn, { float: 'right', border: 'none', background: 'none', fontSize: '16px', cursor: 'pointer' });
+        ui.appendChild(toggleBtn);
+
+        const content = document.createElement('div');
+
+        const info = document.createElement('div');
+        info.innerHTML = `
+            <strong>抽出情報:</strong><br>
+            日付: <strong>${date}</strong><br>
+            開始: <strong>${startTime}</strong><br>
+            終了: <strong>${endTime}</strong>${adj ? ' <span style="color:red">(翌日)</span>' : ''}<br>
+            タイトル: <strong>${title}</strong><br><br>
+            現場住所: ${jobSiteAddress}<br>
+            持ち物: ${requiredItems}<br>
+            服装: ${dressCode}
+        `;
+        content.appendChild(info);
+
+        const btn = document.createElement('button');
+        btn.textContent = '📅 Google Calendarに登録';
+        applyStyles(btn, { marginTop: '10px', padding: '8px 12px', background: '#34A853', color: '#fff', border: 'none', borderRadius: '5px', cursor: 'pointer' });
+        if (!calendarUrl) {
+            btn.disabled = true;
+            btn.textContent = '📅 登録不可';
+            btn.style.backgroundColor = '#aaa';
+        }
+        const status = document.createElement('div');
+        applyStyles(status, { marginTop: '8px', fontSize: '14px' });
+        updateRegistrationStatus(status, isRegistered);
+
+        btn.onclick = () => {
+            if (calendarUrl) window.open(calendarUrl, '_blank');
+            if (flagKey) {
+                GM_setValue(flagKey, true);
+                updateRegistrationStatus(status, true);
+            }
+        };
+
+        content.appendChild(btn);
+        content.appendChild(status);
+        ui.appendChild(content);
+
+        toggleBtn.onclick = () => {
+            const show = content.style.display !== 'none';
+            content.style.display = show ? 'none' : 'block';
+            toggleBtn.textContent = show ? '▲' : '▼';
+        };
+
+        document.body.appendChild(ui);
+    }
+
+    function main() {
+        const jobId = getJobIdFromUrl();
+        const flagKey = jobId ? `${REGISTERED_FLAG_PREFIX}${jobId}` : null;
+        const isRegistered = flagKey ? GM_getValue(flagKey, false) : false;
+        const details = extractJobDetails();
+        if (!details) return;
+        const calendarUrl = generateCalendarUrl(details);
+        createAndAppendUI(details, calendarUrl, isRegistered, flagKey);
+        console.log('[e-NextLevel Calendar] 完了');
+    }
+
+    main();
 })();
