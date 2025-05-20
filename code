@@ -1,76 +1,21 @@
 // ==UserScript==
-// @name         e-NextLevel カレンダー登録ボタン (v2.0 with API Integration)
+// @name         e-NextLevel カレンダー登録ボタン (v1.9.3 Refactored)
 // @namespace    http://tampermonkey.net/
-// @version      2.0
-// @description  作業日と時間をGoogleカレンダー（指定ID）に直接登録
+// @version      1.9.3
+// @description  作業日と集合～終了時刻をGoogleカレンダーに登録する（折りたたみUI・関数分離強化）
 // @match        https://www.e-nextlevel.jp/work/detail/*
 // @grant        GM_setValue
 // @grant        GM_getValue
-// @grant        GM_addElement
-// @grant        GM_registerMenuCommand
 // @run-at       document-idle
 // ==/UserScript==
 
 (function () {
     'use strict';
-    const CLIENT_ID = 'YOUR_CLIENT_ID.apps.googleusercontent.com'; // ← Googleで取得
-    const API_KEY = 'YOUR_API_KEY'; // ← Googleで取得
-    const CALENDAR_ID = '9ebb2cfee458c0715c8034417e4a36e15cff78b5462a91a3a77f50a1fa4ca521@group.calendar.google.com';
-    const SCOPES = 'https://www.googleapis.com/auth/calendar.events';
+    console.log('[e-NextLevel Calendar v1.9.3 Refactored] Script Started');
 
     const REGISTERED_FLAG_PREFIX = 'calendar_registered_';
 
-    // --- Google API読み込み ---
-    function loadGapi(callback) {
-        if (typeof gapi === 'undefined') {
-            GM_addElement('script', {
-                src: 'https://apis.google.com/js/api.js',
-                onload: callback
-            });
-        } else {
-            callback();
-        }
-    }
-
-    function authorizeAndAddEvent(eventDetails, flagKey, statusEl) {
-        gapi.load('client:auth2', async () => {
-            await gapi.client.init({
-                apiKey: API_KEY,
-                clientId: CLIENT_ID,
-                discoveryDocs: ["https://www.googleapis.com/discovery/v1/apis/calendar/v3/rest"],
-                scope: SCOPES
-            });
-
-            const authInstance = gapi.auth2.getAuthInstance();
-            if (!authInstance.isSignedIn.get()) {
-                await authInstance.signIn();
-            }
-
-            const startDateTime = formatDateTime(eventDetails.date, eventDetails.startTime);
-            const endDateTime = formatDateTime(eventDetails.date, eventDetails.endTime,
-                calculateEndTimeDayAdjustment(eventDetails.startTime, eventDetails.endTime));
-
-            const event = {
-                summary: eventDetails.title,
-                location: eventDetails.jobSiteAddress,
-                description: `詳細URL: ${location.href}\n\n持ち物:\n${eventDetails.requiredItems}\n\n服装:\n${eventDetails.dressCode}`,
-                start: { dateTime: startDateTime, timeZone: 'Asia/Tokyo' },
-                end: { dateTime: endDateTime, timeZone: 'Asia/Tokyo' }
-            };
-
-            try {
-                await gapi.client.calendar.events.insert({
-                    calendarId: CALENDAR_ID,
-                    resource: event
-                });
-                GM_setValue(flagKey, true);
-                updateRegistrationStatus(statusEl, true);
-                alert('✅ Googleカレンダーに登録しました。');
-            } catch (e) {
-                alert('❌ カレンダー登録に失敗しました: ' + e.message);
-            }
-        });
-    }
+    // --- ヘルパー関数群 ---
 
     function getJobIdFromUrl() {
         const match = location.pathname.match(/\/(\d+)$/);
@@ -118,6 +63,26 @@
         return { dressCode, requiredItems };
     }
 
+    function calculateEndTimeDayAdjustment(start, end) {
+        const [sh, sm] = start.split(':').map(Number);
+        const [eh, em] = end.split(':').map(Number);
+        return sh * 60 + sm > eh * 60 + em ? 1 : 0;
+    }
+
+    function formatDateTime(dateStr, timeStr, addDay = 0) {
+        if (!dateStr || !timeStr) return '';
+        const [y, m, d] = dateStr.split('-').map(Number);
+        const date = new Date(y, m - 1, d);
+        if (isNaN(date)) return '';
+        date.setDate(date.getDate() + addDay);
+        const yyyy = date.getFullYear();
+        const mm = String(date.getMonth() + 1).padStart(2, '0');
+        const dd = String(date.getDate()).padStart(2, '0');
+        const time = timeStr.replace(/:/g, '');
+        if (!/^\d{4}$/.test(time)) return '';
+        return `${yyyy}${mm}${dd}T${time}00`;
+    }
+
     function extractJobDetails() {
         const text = document.body.innerText;
         const date = extractDateFromText(text);
@@ -128,18 +93,27 @@
         return { date, startTime, endTime, title, jobSiteAddress: address, dressCode, requiredItems };
     }
 
-    function formatDateTime(dateStr, timeStr, addDay = 0) {
-        if (!dateStr || !timeStr) return '';
-        const [y, m, d] = dateStr.split('-').map(Number);
-        const date = new Date(y, m - 1, d);
-        date.setDate(date.getDate() + addDay);
-        return `${date.toISOString().split('T')[0]}T${timeStr}:00`;
-    }
+    function generateCalendarUrl({ date, startTime, endTime, title, jobSiteAddress, requiredItems, dressCode }) {
+        if (!date || !startTime || !endTime || !title) return '';
+        const adj = calculateEndTimeDayAdjustment(startTime, endTime);
+        const url = new URL('https://calendar.google.com/calendar/render');
+        url.searchParams.set('action', 'TEMPLATE');
+        url.searchParams.set('text', title);
 
-    function calculateEndTimeDayAdjustment(start, end) {
-        const [sh, sm] = start.split(':').map(Number);
-        const [eh, em] = end.split(':').map(Number);
-        return sh * 60 + sm > eh * 60 + em ? 1 : 0;
+        const lines = [
+            `詳細URL: ${location.href}`,
+            jobSiteAddress ? `現場住所: ${jobSiteAddress}` : '',
+            requiredItems ? `\n持ち物:\n${requiredItems}` : '',
+            dressCode ? `\n服装:\n${dressCode}` : ''
+        ].filter(Boolean);
+
+        url.searchParams.set('details', lines.join('\n\n'));
+        if (jobSiteAddress) url.searchParams.set('location', jobSiteAddress);
+
+        const start = formatDateTime(date, startTime);
+        const end = formatDateTime(date, endTime, adj);
+        if (start && end) url.searchParams.set('dates', `${start}/${end}`);
+        return url.toString();
     }
 
     function applyStyles(el, styles) {
@@ -149,43 +123,67 @@
     function updateRegistrationStatus(el, registered) {
         el.textContent = registered ? '✅ 登録済み' : '🕒 未登録';
         el.style.color = registered ? '#2e7d32' : '#757575';
+        el.style.fontWeight = registered ? 'bold' : 'normal';
     }
 
-    function createUI(details, isRegistered, flagKey) {
-        const ui = document.createElement('div');
-        applyStyles(ui, {
-            position: 'fixed', top: '20px', right: '20px', background: '#fff',
-            border: '1px solid #ccc', padding: '12px', zIndex: 10000, fontFamily: 'sans-serif',
-            borderRadius: '8px', boxShadow: '0 4px 10px rgba(0,0,0,0.1)', maxWidth: '400px'
-        });
+    function createAndAppendUI(details, calendarUrl, isRegistered, flagKey) {
+        const { date, startTime, endTime, title, jobSiteAddress, requiredItems, dressCode } = details;
+        const adj = calculateEndTimeDayAdjustment(startTime, endTime);
 
-        const status = document.createElement('div');
-        updateRegistrationStatus(status, isRegistered);
+        const ui = document.createElement('div');
+        ui.id = 'calendar-ui';
+        applyStyles(ui, { position: 'fixed', top: '20px', right: '20px', background: '#fff', border: '1px solid #ccc', padding: '12px', zIndex: 10000, fontFamily: 'sans-serif', borderRadius: '8px', boxShadow: '0 4px 10px rgba(0,0,0,0.1)', maxWidth: '400px' });
+
+        const toggleBtn = document.createElement('button');
+        toggleBtn.textContent = '▼';
+        applyStyles(toggleBtn, { float: 'right', border: 'none', background: 'none', fontSize: '16px', cursor: 'pointer' });
+        ui.appendChild(toggleBtn);
+
+        const content = document.createElement('div');
+
+        const info = document.createElement('div');
+        info.innerHTML = `
+            <strong>抽出情報:</strong><br>
+            日付: <strong>${date}</strong><br>
+            開始: <strong>${startTime}</strong><br>
+            終了: <strong>${endTime}</strong>${adj ? ' <span style="color:red">(翌日)</span>' : ''}<br>
+            タイトル: <strong>${title}</strong><br><br>
+            現場住所: ${jobSiteAddress}<br>
+            持ち物: ${requiredItems}<br>
+            服装: ${dressCode}
+        `;
+        content.appendChild(info);
 
         const btn = document.createElement('button');
-        btn.textContent = '📅 Googleカレンダーに登録';
-        applyStyles(btn, {
-            marginTop: '10px', padding: '8px 12px',
-            background: '#4285F4', color: '#fff',
-            border: 'none', borderRadius: '5px', cursor: 'pointer'
-        });
+        btn.textContent = '📅 Google Calendarに登録';
+        applyStyles(btn, { marginTop: '10px', padding: '8px 12px', background: '#34A853', color: '#fff', border: 'none', borderRadius: '5px', cursor: 'pointer' });
+        if (!calendarUrl) {
+            btn.disabled = true;
+            btn.textContent = '📅 登録不可';
+            btn.style.backgroundColor = '#aaa';
+        }
+        const status = document.createElement('div');
+        applyStyles(status, { marginTop: '8px', fontSize: '14px' });
+        updateRegistrationStatus(status, isRegistered);
 
         btn.onclick = () => {
-            loadGapi(() => authorizeAndAddEvent(details, flagKey, status));
+            if (calendarUrl) window.open(calendarUrl, '_blank');
+            if (flagKey) {
+                GM_setValue(flagKey, true);
+                updateRegistrationStatus(status, true);
+            }
         };
 
-        ui.innerHTML = `
-            <strong>抽出情報:</strong><br>
-            日付: ${details.date}<br>
-            開始: ${details.startTime}<br>
-            終了: ${details.endTime}<br>
-            タイトル: ${details.title}<br>
-            現場住所: ${details.jobSiteAddress}<br>
-            持ち物: ${details.requiredItems}<br>
-            服装: ${details.dressCode}<br><br>
-        `;
-        ui.appendChild(btn);
-        ui.appendChild(status);
+        content.appendChild(btn);
+        content.appendChild(status);
+        ui.appendChild(content);
+
+        toggleBtn.onclick = () => {
+            const show = content.style.display !== 'none';
+            content.style.display = show ? 'none' : 'block';
+            toggleBtn.textContent = show ? '▲' : '▼';
+        };
+
         document.body.appendChild(ui);
     }
 
@@ -194,8 +192,10 @@
         const flagKey = jobId ? `${REGISTERED_FLAG_PREFIX}${jobId}` : null;
         const isRegistered = flagKey ? GM_getValue(flagKey, false) : false;
         const details = extractJobDetails();
-        if (!details.date || !details.startTime || !details.endTime || !details.title) return;
-        createUI(details, isRegistered, flagKey);
+        if (!details) return;
+        const calendarUrl = generateCalendarUrl(details);
+        createAndAppendUI(details, calendarUrl, isRegistered, flagKey);
+        console.log('[e-NextLevel Calendar] 完了');
     }
 
     main();
